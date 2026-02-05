@@ -24,7 +24,7 @@ USAGE (examples):
 
   # 2) Continual pretraining (CPT) phase A: Reconstruction curriculum (freeze decoder)
   #    python refrag.py cpt_recon --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-3B      //meta-llama/Llama-3.2-1B
-
+  
   # 3) Continual pretraining (CPT) phase B: Next-paragraph prediction curriculum (unfreeze decoder)
   #    python refrag.py cpt_next --train_json data/cpt_train.jsonl --enc roberta-base --dec meta-llama/Llama-3.2-3B       //meta-llama/Llama-3.2-1B
 
@@ -954,14 +954,92 @@ def cmd_generate(args):
                 model.policy.load_state_dict(safe_torch_load(pol_p, map_location=now_device()))
             print("[generate] loaded available component weights.")
 
-    texts, index = load_index_bundle(args.index_dir)
-    qenc = PassageEncoder(args.embed_model)
-    qv = qenc.encode_query(args.question)
-    _, I = search_index(index, qv, args.topk)
-    passages = [texts[i] for i in I]
+    # Load from JSON file if provided, otherwise use FAISS
+    if hasattr(args, 'json_file') and args.json_file:
+        print(f"[generate] Loading question and context from {args.json_file}")
+        try:
+            with open(args.json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"[generate] JSON parsing error: {e}")
+            print(f"[generate] Attempting to read as JSONL format...")
+            # Try JSONL format (one JSON object per line)
+            data = {"data": []}
+            with open(args.json_file, 'r', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    if line.strip():
+                        try:
+                            data["data"].append(json.loads(line))
+                        except json.JSONDecodeError:
+                            print(f"[generate] Skipping malformed line {i+1}")
+                            continue
+            if not data["data"]:
+                raise ValueError("Could not parse any valid JSON from file")
+
+        # Process all questions if --process_all is set
+        if args.process_all:
+            all_data = data.get('data', [])
+            print(f"[generate] Processing all {len(all_data)} questions from JSON file")
+
+            for idx, question_data in enumerate(all_data):
+                question = question_data.get('question', '')
+                passages = question_data.get('context', [])
+                print(f"\n[generate] Processing question {idx + 1}/{len(all_data)}: {question[:80]}...")
+
+                out = model.generate(
+                    question=question,
+                    passages=passages,
+                    k=args.k,
+                    p=args.p,
+                    max_new_tokens=args.max_new,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    use_policy=(not args.heuristic),
+                )
+
+                result = {"question": question, "passages": passages, **out}
+
+                if args.output:
+                    # Create output filename with index
+                    output_file = f"{args.output}_{idx}.json"
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        json.dump(result, f, indent=2)
+                    print(f"[generate] Saved output to {output_file}")
+                else:
+                    print(json.dumps(result, indent=2))
+                    print("\n" + "="*80 + "\n")
+
+            print(f"\n[generate] Completed processing all {len(all_data)} questions")
+            return
+
+        # Find the question in the data (single question mode)
+        question_data = None
+        for item in data.get('data', []):
+            if args.question and item.get('question') == args.question:
+                question_data = item
+                break
+
+        if question_data is None and data.get('data'):
+            # If no match or no question specified, use the first item
+            question_data = data['data'][args.question_idx if hasattr(args, 'question_idx') else 0]
+
+        if question_data:
+            question = question_data.get('question', args.question or '')
+            passages = question_data.get('context', [])
+            print(f"[generate] Using {len(passages)} context passages from JSON")
+        else:
+            raise ValueError("No question data found in JSON file")
+    else:
+        # Original FAISS-based retrieval
+        texts, index = load_index_bundle(args.index_dir)
+        qenc = PassageEncoder(args.embed_model)
+        qv = qenc.encode_query(args.question)
+        _, I = search_index(index, qv, args.topk)
+        passages = [texts[i] for i in I]
+        question = args.question
 
     out = model.generate(
-        question=args.question,
+        question=question,
         passages=passages,
         k=args.k,
         p=args.p,
@@ -970,7 +1048,15 @@ def cmd_generate(args):
         top_p=args.top_p,
         use_policy=(not args.heuristic),
     )
-    print(json.dumps({"question": args.question, "passages": passages, **out}, indent=2))
+
+    result = {"question": question, "passages": passages, **out}
+
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2)
+        print(f"[generate] Saved output to {args.output}")
+    else:
+        print(json.dumps(result, indent=2))
 
 
 # ----------------------------
@@ -1037,11 +1123,13 @@ def build_argparser():
 
     # generate
     sp = sub.add_parser("generate", help="RAG generate with compression/expansion")
-    sp.add_argument("--index_dir", type=str, required=True, help="Directory containing texts.npy + faiss.index")
+    sp.add_argument("--index_dir", type=str, default="", help="Directory containing texts.npy + faiss.index (not needed if using --json_file)")
+    sp.add_argument("--json_file", type=str, default="", help="JSON file with question-context pairs (skips FAISS retrieval)")
+    sp.add_argument("--question_idx", type=int, default=0, help="Index of question to use from JSON file (default: 0)")
     sp.add_argument("--embed_model", type=str, default="BAAI/bge-small-en-v1.5")
     sp.add_argument("--enc", type=str, default="roberta-base")
     sp.add_argument("--dec", type=str, default="meta-llama/Llama-3.2-3B")
-    sp.add_argument("--question", type=str, required=True)
+    sp.add_argument("--question", type=str, default="", help="Question text (optional if using --json_file)")
     sp.add_argument("--topk", type=int, default=8)
     sp.add_argument("--k", type=int, default=64, help="Chunk length in tokens")
     sp.add_argument("--p", type=float, default=0.25, help="Max expansion fraction")
@@ -1051,6 +1139,8 @@ def build_argparser():
     sp.add_argument("--top_p", type=float, default=1.0)
     sp.add_argument("--heuristic", action="store_true", help="Use heuristic expansion instead of policy")
     sp.add_argument("--load_dir", type=str, default="", help="Optional: dir with saved weights (encoder/projector/policy or refrag_full.pt)")
+    sp.add_argument("--output", type=str, default="", help="Output file path to save results (if not specified, prints to stdout)")
+    sp.add_argument("--process_all", action="store_true", help="Process all questions in JSON file (saves to {output}_{idx}.json)")
     sp.add_argument("--torch_compile", action="store_true", help="Enable torch.compile for the decoder (PyTorch 2.0+)")
     sp.set_defaults(func=cmd_generate)
 

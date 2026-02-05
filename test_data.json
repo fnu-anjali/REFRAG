@@ -1,0 +1,23 @@
+{
+  "name": "test_dataset",
+  "data": [
+    {
+      "question": "What is the capital of France?",
+      "context": [
+        "Paris is the capital and most populous city of France.",
+        "France is a country in Western Europe.",
+        "The city has been one of Europe's major centers of finance, diplomacy, commerce, fashion, and the arts."
+      ],
+      "ground_truth": "Paris is the capital of France."
+    },
+    {
+      "question": "Who wrote Romeo and Juliet?",
+      "context": [
+        "William Shakespeare was an English playwright and poet.",
+        "Romeo and Juliet is a tragedy written by William Shakespeare.",
+        "It was written in the early part of Shakespeare's career, between 1594 and 1596."
+      ],
+      "ground_truth": "William Shakespeare wrote Romeo and Juliet."
+    }
+  ]
+}
