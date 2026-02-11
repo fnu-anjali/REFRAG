@@ -954,6 +954,107 @@ def cmd_generate(args):
                 model.policy.load_state_dict(safe_torch_load(pol_p, map_location=now_device()))
             print("[generate] loaded available component weights.")
 
+    # Load questions from JSON file and use FAISS retrieval
+    if hasattr(args, 'questions_file') and args.questions_file:
+        print(f"[generate] Loading questions from {args.questions_file}")
+
+        # Load FAISS index for retrieval
+        if not args.index_dir:
+            raise ValueError("--index_dir is required when using --questions_file with FAISS retrieval")
+
+        texts, index = load_index_bundle(args.index_dir)
+        qenc = PassageEncoder(args.embed_model)
+
+        # Load questions from JSON
+        try:
+            with open(args.questions_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"[generate] JSON parsing error: {e}")
+            raise ValueError(f"Could not parse JSON from {args.questions_file}")
+
+        all_questions = data.get('data', [])
+        if not all_questions:
+            raise ValueError("No questions found in JSON file")
+
+        print(f"[generate] Found {len(all_questions)} questions. Processing with FAISS retrieval...")
+
+        # Create output directory if needed
+        output_dir = None
+        if args.output:
+            output_dir = os.path.dirname(args.output)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+        # Process all questions
+        results = []
+        for idx, question_data in enumerate(all_questions):
+            question = question_data.get('question', '')
+            if not question:
+                print(f"[generate] Skipping item {idx} - no question field")
+                continue
+
+            print(f"\n[generate] Processing question {idx + 1}/{len(all_questions)}: {question[:80]}...")
+
+            # FAISS retrieval
+            qv = qenc.encode_query(question)
+            _, I = search_index(index, qv, args.topk)
+            passages = [texts[i] for i in I]
+
+            # Generate answer
+            out = model.generate(
+                question=question,
+                passages=passages,
+                k=args.k,
+                p=args.p,
+                max_new_tokens=args.max_new,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                use_policy=(not args.heuristic),
+            )
+
+            result = {
+                "question": question,
+                "answer": out["answer"],
+                "retrieval_method": "FAISS",
+                "num_passages": len(passages),
+                "TTFT_sec": out["TTFT_sec"],
+                "TTIT_avg_sec": out["TTIT_avg_sec"],
+                "throughput_tok_per_sec": out["throughput_tok_per_sec"],
+                "meta": out["meta"]
+            }
+
+            # Include ground truth if available
+            if "answer" in question_data:
+                result["ground_truth"] = question_data["answer"]
+
+            results.append(result)
+
+            # Save individual results if output path is specified
+            if args.output:
+                output_file = f"{args.output}_{idx}.json"
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=2)
+                print(f"[generate] Saved output to {output_file}")
+            else:
+                print(json.dumps(result, indent=2))
+                print("\n" + "="*80)
+
+        # Save summary
+        if args.output:
+            summary_file = f"{args.output}_summary.json"
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "total_questions": len(results),
+                    "avg_TTFT_sec": sum(r["TTFT_sec"] for r in results) / len(results) if results else 0,
+                    "avg_throughput": sum(r["throughput_tok_per_sec"] for r in results) / len(results) if results else 0,
+                    "results": results
+                }, f, indent=2)
+            print(f"\n[generate] Saved summary to {summary_file}")
+
+        print(f"\n[generate] Completed processing {len(results)} questions")
+        return
+
     # Load from JSON file if provided, otherwise use FAISS
     if hasattr(args, 'json_file') and args.json_file:
         print(f"[generate] Loading question and context from {args.json_file}")
@@ -1124,12 +1225,13 @@ def build_argparser():
     # generate
     sp = sub.add_parser("generate", help="RAG generate with compression/expansion")
     sp.add_argument("--index_dir", type=str, default="", help="Directory containing texts.npy + faiss.index (not needed if using --json_file)")
+    sp.add_argument("--questions_file", type=str, default="", help="JSON file with questions (uses FAISS retrieval for each question)")
     sp.add_argument("--json_file", type=str, default="", help="JSON file with question-context pairs (skips FAISS retrieval)")
     sp.add_argument("--question_idx", type=int, default=0, help="Index of question to use from JSON file (default: 0)")
     sp.add_argument("--embed_model", type=str, default="BAAI/bge-small-en-v1.5")
     sp.add_argument("--enc", type=str, default="roberta-base")
     sp.add_argument("--dec", type=str, default="meta-llama/Llama-3.2-3B")
-    sp.add_argument("--question", type=str, default="", help="Question text (optional if using --json_file)")
+    sp.add_argument("--question", type=str, default="", help="Question text (optional if using --json_file or --questions_file)")
     sp.add_argument("--topk", type=int, default=8)
     sp.add_argument("--k", type=int, default=64, help="Chunk length in tokens")
     sp.add_argument("--p", type=float, default=0.25, help="Max expansion fraction")
