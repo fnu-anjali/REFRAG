@@ -314,20 +314,29 @@ class REFRAG(nn.Module):
             m[torch.tensor(picked, device=self.device)] = True
         return m
 
-    def sample_action_sequence(self, logits: torch.Tensor, Tprime: int) -> Tuple[List[int], torch.Tensor]:
+    def sample_action_sequence(self, logits: torch.Tensor, Tprime: int):
         L = int(logits.numel())
         picked: List[int] = []
         logps: List[torch.Tensor] = []
+
+        # keep mask on same device as logits
         mask = torch.zeros(L, dtype=torch.bool, device=logits.device)
+
         for _ in range(Tprime):
-            masked_logits = logits.clone()
-            masked_logits[mask] = -1e9
+            # non-inplace masking
+            masked_logits = logits.masked_fill(mask, -1e9)
             dist = torch.distributions.Categorical(logits=masked_logits)
+
             a = dist.sample()
             logps.append(dist.log_prob(a))
+
             ai = int(a.item())
             picked.append(ai)
+
+            # non-inplace mask update
+            mask = mask.clone()
             mask[ai] = True
+
         return picked, torch.stack(logps)
 
     @staticmethod
@@ -335,13 +344,17 @@ class REFRAG(nn.Module):
         L = int(logits.numel())
         mask = torch.zeros(L, dtype=torch.bool, device=logits.device)
         out: List[torch.Tensor] = []
-        for a in picked:
-            masked = logits.clone()
-            masked[mask] = -1e9
-            dist = torch.distributions.Categorical(logits=masked)
-            a_t = torch.tensor(int(a), device=logits.device)
+
+        for ai in picked:
+            masked_logits = logits.masked_fill(mask, -1e9)
+            dist = torch.distributions.Categorical(logits=masked_logits)
+
+            a_t = torch.tensor(int(ai), device=logits.device)
             out.append(dist.log_prob(a_t))
-            mask[int(a)] = True
+
+            mask = mask.clone()
+            mask[int(ai)] = True
+
         return torch.stack(out)
 
     # --- Heuristic unchanged (optional) ---
@@ -736,6 +749,7 @@ def cmd_train_policy(args):
     G = cfg.grpo_group_G
 
     model.train()
+    torch.autograd.set_detect_anomaly(True)
     for step in range(args.steps):
         ex = random.choice(data)
         text = ex["tokens"]
