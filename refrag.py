@@ -487,7 +487,7 @@ class REFRAG(nn.Module):
     # ----------------------------
     # Losses for CPT & RL policy
     # ----------------------------
-    def loss_reconstruction(self, ctx_text: str, k: int, num_chunks_cap: Optional[int] = None) -> torch.Tensor:
+    def loss_reconstruction(self, ctx_text: str,current_step, k: int, num_chunks_cap: Optional[int] = None) -> torch.Tensor:
         """
         Train encoder+projector to reconstruct tokens chunk-by-chunk from a single projected vector.
 
@@ -526,10 +526,17 @@ class REFRAG(nn.Module):
             out = self.decoder(inputs_embeds=inp_emb, attention_mask=attn_mask, labels=labels)
             loss_accum = loss_accum + out.loss
 
+            if current_step % 50 == 0:
+                predicted_ids = torch.argmax(out.logits, dim=-1)
+                predicted_text = self.decoder_tok.decode(predicted_ids[0], skip_special_tokens=True)
+                original_text = self.decoder_tok.decode(labels[0], skip_special_tokens=True)
+                print(f"  original : {original_text}")
+                print(f"  predicted: {predicted_text}")
+
         return loss_accum / max(L, 1)
 
 
-    def loss_next_para(self, full_text: str, s: int, o: int, k: int, expand_frac: float = 0.0) -> torch.Tensor:
+    def loss_next_para(self, full_text: str, steps: int, s: int, o: int, k: int, expand_frac: float = 0.0) -> torch.Tensor:
         """
         Feed up to s tokens (compressed/expanded context) and predict up to o tokens.
         Fix: treat s/o as maxima; clamp per-example so we always have target tokens when possible.
@@ -631,6 +638,20 @@ class REFRAG(nn.Module):
         labels[0, T_ctx:T_ctx + T_tgt] = out_ids
 
         out = self.decoder(inputs_embeds=inputs, attention_mask=attn_mask, labels=labels)
+
+        if steps >= 0 and (steps % 2 == 0):
+            with torch.no_grad():
+                gt_text = self.decoder_tok.decode(out_ids.detach().cpu(), skip_special_tokens=True)
+
+                pred_ids = out.logits[0, T_ctx:T_ctx + T_tgt].argmax(dim=-1)
+                pred_text = self.decoder_tok.decode(pred_ids.detach().cpu(), skip_special_tokens=True)
+
+            print("\n====== DEBUG loss_next_para ======")
+            print(f"step={steps}")
+            print(f"GT target:\n{gt_text}\n")
+            print(f"Pred target (argmax):\n{pred_text}\n")
+            print("=================================\n")
+
         return out.loss
 
 
@@ -790,7 +811,7 @@ def cmd_cpt_recon(args):
         chunk_strs, _ = model._chunk_text(text, k_tokens=cfg.chunk_len_tokens)
         max_chunks = max(1, len(chunk_strs))
         cap = curriculum_schedule(steps, max_chunks)[step]
-        loss = model.loss_reconstruction(text, k=cfg.chunk_len_tokens, num_chunks_cap=cap)
+        loss = model.loss_reconstruction(text, current_step=step, k=cfg.chunk_len_tokens, num_chunks_cap=cap)
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(params, cfg.grad_clip)
@@ -839,7 +860,7 @@ def cmd_cpt_next(args):
         text = ex["tokens"]
         s = ex.get("split", {}).get("s", 2048)
         o = ex.get("split", {}).get("o", 256)
-        loss = model.loss_next_para(text, s=s, o=o, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
+        loss = model.loss_next_para(text, steps=step, s=s, o=o, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(params, cfg.grad_clip)

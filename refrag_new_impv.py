@@ -34,6 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
+import time
 
 from transformers import (
     AutoTokenizer,
@@ -477,9 +478,14 @@ class REFRAG(nn.Module):
     # --- CPT losses ---
     def loss_reconstruction(self, ctx_text: str, current_step, k: int, num_chunks_cap: Optional[int] = None) -> torch.Tensor:
         chunk_strs, chunk_ids = self._chunk_text(ctx_text, k_tokens=k)
+        # print(f"chunk_strs: {chunk_strs}", len(chunk_strs))
+        # print(f"chunk_ids: {chunk_ids}", len(chunk_ids))
+        # print(f"num_chunks_cap: {num_chunks_cap}")
         if num_chunks_cap is not None:
             chunk_strs = chunk_strs[:num_chunks_cap]
             chunk_ids = chunk_ids[:num_chunks_cap]
+        # print(f"chunk_strs: {chunk_strs}")
+        # print(f"chunk_ids: {chunk_ids}")
         L = len(chunk_strs)
         if L == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -487,24 +493,39 @@ class REFRAG(nn.Module):
         c = self._encode_chunks(chunk_strs)
         e = self._project_chunks(c)
 
-        loss_accum = 0.0
-        for i, ids in enumerate(chunk_ids):
-            labels = ids.unsqueeze(0).to(self.device)
-            T = labels.size(1)
-            inp_emb = e[i].unsqueeze(0).unsqueeze(1).expand(1, T, -1).contiguous()
-            out = self.decoder(inputs_embeds=inp_emb, labels=labels)
-            loss_accum = loss_accum + out.loss
+        # all chunk embeddings as prefix, reconstruct ALL tokens x1:L*k together
+        prefix_emb = e.unsqueeze(0)  # (1, L, hidden)
 
-            if current_step % 50 == 0:
-                predicted_ids = torch.argmax(out.logits, dim=-1)
-                predicted_text = self.decoder_tok.decode(predicted_ids[0], skip_special_tokens=True)
-                original_text = self.decoder_tok.decode(labels[0], skip_special_tokens=True)
-                print(f"  original : {original_text}")
-                print(f"  predicted: {predicted_text}")
-                
-        return loss_accum / max(L, 1)
+        # all token ids concatenated: x1:L*k
+        all_token_ids = torch.cat([ids.to(self.device) for ids in chunk_ids], dim=0)  # (L*k,)
+        token_emb = self.decoder.get_input_embeddings()(all_token_ids.unsqueeze(0))   # (1, L*k, hidden)
 
-    def loss_next_para(self, full_text: str, s: int, o: int, k: int, expand_frac: float = 0.0) -> torch.Tensor:
+        # full input: [e1, e2, ..., eL, token_1, token_2, ..., token_L*k]
+        inp_emb = torch.cat([prefix_emb, token_emb], dim=1)  # (1, L+L*k, hidden)
+
+        # labels: -100 for the L prefix positions, real ids for L*k token positions
+        ignore = torch.full((1, L), -100, dtype=torch.long, device=self.device)
+        labels = torch.cat([ignore, all_token_ids.unsqueeze(0)], dim=1)  # (1, L+L*k)
+
+        out = self.decoder(inputs_embeds=inp_emb, labels=labels)
+
+        if current_step % 100 == 0:
+            predicted_ids = torch.argmax(out.logits, dim=-1)  # (1, L+L*k)
+            # skip L prefix positions, drop last (shifted), decode middle
+            predicted_text = self.decoder_tok.decode(predicted_ids[0][L:-1], skip_special_tokens=True)
+            original_text = self.decoder_tok.decode(all_token_ids, skip_special_tokens=True)
+            print(f"num_chunks_cap: {num_chunks_cap}")
+            print(f"  loss     : {out.loss.item():.4f}")
+            print(f"  original : {original_text}")
+            print(f"  predicted: {predicted_text}")
+            print(f"  prefix length  : {prefix_emb.shape[1]}")
+            print(f"  tokens to recon: {token_emb.shape[1]}")
+            print(f"  total inp_emb  : {inp_emb.shape[1]}")
+            print(f"  logits shape   : {out.logits.shape}")
+
+        return out.loss
+
+    def loss_next_para(self, full_text: str, steps: int, s: int, o: int, k: int, expand_frac: float = 0.0) -> torch.Tensor:
         toks = self.decoder_tok(full_text, truncation=True, max_length=s + o, return_tensors="pt")
         ids = toks.input_ids[0].to(self.device)
         N = int(ids.numel())
@@ -553,6 +574,24 @@ class REFRAG(nn.Module):
         labels[0, ctx_emb.size(1):] = out_ids
 
         out = self.decoder(inputs_embeds=inputs, labels=labels)
+
+        if steps > 0 and (steps % 100 == 0):
+            with torch.no_grad():
+                # Ground truth target text
+                gt_text = self.decoder_tok.decode(out_ids.detach().cpu(), skip_special_tokens=True)
+
+                # Predicted token ids for ONLY the target positions
+                T_ctx = int(ctx_emb.size(1))
+                T_tgt = int(tgt_ids.size(1))
+
+                pred_ids = out.logits[0, T_ctx:T_ctx + T_tgt].argmax(dim=-1)   # [T_tgt]
+                pred_text = self.decoder_tok.decode(pred_ids.detach().cpu(), skip_special_tokens=True)
+
+            print("\n====== DEBUG loss_next_para ======")
+            print("GT target:\n", gt_text)
+            print("Pred target (argmax):\n", pred_text)
+            print("=================================\n")
+
         return out.loss
 
     @torch.no_grad()
@@ -657,14 +696,18 @@ def cmd_cpt_recon(args):
         return
     model.train()
     plan_cache = None
+
     for step in range(args.steps):
         ex = random.choice(data)
         text = ex["tokens"]
         chunk_strs, _ = model._chunk_text(text, k_tokens=cfg.chunk_len_tokens)
         max_chunks = max(1, len(chunk_strs))
+        # print(f"max_chunks: {max_chunks}")
         plan_cache = plan_cache or curriculum_schedule(args.steps, max_chunks)
+        # print(f"plan_cache: {plan_cache}")
         cap = plan_cache[step]
-        loss = model.loss_reconstruction(text, current_step=step, k=cfg.chunk_len_tokens, num_chunks_cap=cap)
+        # print(f"cap : {cap}")
+        loss = model.loss_reconstruction(text,current_step=step, k=cfg.chunk_len_tokens, num_chunks_cap=cap)
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(params, cfg.grad_clip)
@@ -696,18 +739,35 @@ def cmd_cpt_next(args):
         print("[cpt_next] no data.")
         return
     model.train()
+
+    CHECKPOINT_STEPS = {500} 
+
     for step in range(args.steps):
         ex = random.choice(data)
         text = ex["tokens"]
         s = ex.get("split", {}).get("s", 2048)
         o = ex.get("split", {}).get("o", 256)
-        loss = model.loss_next_para(text, s=s, o=o, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
+        loss = model.loss_next_para(text, steps=step, s=s, o=o, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         opt.step(); sch.step()
         if step % max(1, args.log_every) == 0:
-            print(f"[cpt_next] step {step}/{args.steps} loss={loss.item():.4f}")
+            print(f"[cpt_next] step {step}/{args.steps} loss={loss.item():.4f}, time={time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        # # Optional: still print occasionally (won't break tqdm)
+        # if step % max(1, args.log_every) == 0:
+        #     tqdm.write(f"[cpt_next] step {step}/{args.steps} loss={loss.item():.4f}")
+
+        # Save intermediate checkpoints
+        if step in CHECKPOINT_STEPS:
+            ckpt_dir = os.path.join(args.out_dir, f"checkpoint_step{step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(ckpt_dir, "refrag_full.pt"))
+            print(f"[cpt_next] checkpoint saved at step {step} → {ckpt_dir}")
+
     os.makedirs(args.out_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.out_dir, "refrag_full.pt"))
     print(f"[cpt_next] saved full model to {args.out_dir}")
