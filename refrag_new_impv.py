@@ -490,8 +490,12 @@ class REFRAG(nn.Module):
         if L == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        c = self._encode_chunks(chunk_strs)
-        e = self._project_chunks(c)
+        with torch.no_grad():
+            c = self._encode_chunks(chunk_strs)
+            e = self._project_chunks(c)
+        # Detach to prevent gradients
+        c = c.detach()
+        e = e.detach()
 
         # all chunk embeddings as prefix, reconstruct ALL tokens x1:L*k together
         prefix_emb = e.unsqueeze(0)  # (1, L, hidden)
@@ -545,8 +549,13 @@ class REFRAG(nn.Module):
         ctx_str = self.decoder_tok.decode(ctx_ids, skip_special_tokens=True)
         chunk_strs, chunk_ids = self._chunk_text(ctx_str, k_tokens=k)
 
-        c = self._encode_chunks(chunk_strs)
-        e = self._project_chunks(c)
+        # Use no_grad for encoding to save memory
+        with torch.no_grad():
+            c = self._encode_chunks(chunk_strs)
+            e = self._project_chunks(c)
+        # Detach to prevent gradient tracking through encoder
+        c = c.detach()
+        e = e.detach()
         L = len(chunk_ids)
 
         # Paper-aligned: choose exactly T'=pL chunks uniformly at random to remain uncompressed
@@ -559,11 +568,13 @@ class REFRAG(nn.Module):
         seq = []
         for i, ids_i in enumerate(chunk_ids):
             if expand_mask[i]:
-                seq.append(self._decoder_token_embeddings(ids_i.unsqueeze(0)).squeeze(0))
+                tok_emb = self._decoder_token_embeddings(ids_i.unsqueeze(0)).squeeze(0)
+                seq.append(tok_emb.detach())
             else:
                 seq.append(e[i].unsqueeze(0))
         if len(seq) == 0:
-            seq.append(self._decoder_token_embeddings(ctx_ids.unsqueeze(0)).squeeze(0))
+            tok_emb = self._decoder_token_embeddings(ctx_ids.unsqueeze(0)).squeeze(0)
+            seq.append(tok_emb.detach())
 
         ctx_emb = torch.cat(seq, dim=0).unsqueeze(0)
         tgt_ids = out_ids.unsqueeze(0)
@@ -584,13 +595,17 @@ class REFRAG(nn.Module):
                 T_ctx = int(ctx_emb.size(1))
                 T_tgt = int(tgt_ids.size(1))
 
-                pred_ids = out.logits[0, T_ctx:T_ctx + T_tgt].argmax(dim=-1)   # [T_tgt]
-                pred_text = self.decoder_tok.decode(pred_ids.detach().cpu(), skip_special_tokens=True)
+                # Use detach and move to CPU immediately to free GPU memory
+                pred_ids = out.logits[0, T_ctx:T_ctx + T_tgt].detach().cpu().argmax(dim=-1)
+                pred_text = self.decoder_tok.decode(pred_ids, skip_special_tokens=True)
 
-            print("\n====== DEBUG loss_next_para ======")
-            print("GT target:\n", gt_text)
-            print("Pred target (argmax):\n", pred_text)
-            print("=================================\n")
+                print("\n====== DEBUG loss_next_para ======")
+                print("GT target:\n", gt_text)
+                print("Pred target (argmax):\n", pred_text)
+                print("=================================\n")
+
+                # Explicitly delete to free memory
+                del pred_ids, gt_text, pred_text
 
         return out.loss
 
@@ -740,20 +755,46 @@ def cmd_cpt_next(args):
         return
     model.train()
 
-    CHECKPOINT_STEPS = {500} 
+    CHECKPOINT_STEPS = {500}
+    gradient_accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
+    accumulated_loss = 0.0
 
     for step in range(args.steps):
+        # Clear cache at start of accumulation cycle
+        if step % gradient_accumulation_steps == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         ex = random.choice(data)
         text = ex["tokens"]
-        s = ex.get("split", {}).get("s", 2048)
+        s = ex.get("split", {}).get("s", getattr(args, 'max_ctx_len', 2048))
         o = ex.get("split", {}).get("o", 256)
         loss = model.loss_next_para(text, steps=step, s=s, o=o, k=cfg.chunk_len_tokens, expand_frac=args.expand_frac)
-        opt.zero_grad()
+
+        # Scale loss by accumulation steps
+        loss = loss / gradient_accumulation_steps
+
+        # Store loss value before backward to avoid holding graph
+        loss_val = loss.item()
+        accumulated_loss += loss_val
+
+        # Backward without zeroing gradients
         loss.backward()
-        nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-        opt.step(); sch.step()
-        if step % max(1, args.log_every) == 0:
-            print(f"[cpt_next] step {step}/{args.steps} loss={loss.item():.4f}, time={time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Explicitly delete loss to free computation graph
+        del loss
+
+        # Only step optimizer after accumulation
+        if (step + 1) % gradient_accumulation_steps == 0:
+            nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+            opt.step()
+            sch.step()
+            opt.zero_grad()
+
+            if step % max(1, args.log_every) == 0:
+                print(f"[cpt_next] step {step}/{args.steps} loss={accumulated_loss:.4f}, time={time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+            accumulated_loss = 0.0
 
         # pbar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -763,6 +804,9 @@ def cmd_cpt_next(args):
 
         # Save intermediate checkpoints
         if step in CHECKPOINT_STEPS:
+            # Clear cache before checkpoint to reduce memory pressure
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             ckpt_dir = os.path.join(args.out_dir, f"checkpoint_step{step}")
             os.makedirs(ckpt_dir, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(ckpt_dir, "refrag_full.pt"))
@@ -964,6 +1008,8 @@ def build_argparser():
     sp.add_argument("--load_dir", type=str, default="")
     sp.add_argument("--out_dir", type=str, default="runs/cpt_next")
     sp.add_argument("--torch_compile", action="store_true")
+    sp.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients")
+    sp.add_argument("--max_ctx_len", type=int, default=2048, help="Max context length (reduce to save memory)")
     sp.set_defaults(func=cmd_cpt_next)
 
     sp = sub.add_parser("train_policy", help="Train policy with GRPO+PPO (paper-aligned)")
