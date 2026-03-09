@@ -164,6 +164,17 @@ def search_index(index, query_vec: np.ndarray, topk: int) -> Tuple[np.ndarray, n
     return D[0], I[0]
 
 
+def parse_original(context_str):
+    """Extract text after 'Original:' and before 'Entites:'"""
+    if isinstance(context_str, dict):
+        return context_str.get("Original", "")
+    # It's a raw string like "Prefix: ...; Original: ... \nEntites: ..."
+    if "Original:" in context_str:
+        original = context_str.split("Original:")[1]
+        if "\nEntites:" in original:
+            original = original.split("\nEntites:")[0]
+        return original.strip()
+    return context_str.strip()
 # ----------------------------
 # REFRAG Core
 # ----------------------------
@@ -246,6 +257,22 @@ class SelectPolicyTransformer(nn.Module):
         s = self.head(h).squeeze(0).squeeze(-1)   # [L]
         return s
 
+class SelectPolicy(nn.Module):
+    """
+    Tiny policy π(ci) that outputs expansion prob per chunk.
+    Input: chunk embedding ci (encoder space) + scalar pos (normalized [0,1]).
+    Output: logits ∈ R (Bernoulli).
+    """
+    def __init__(self, in_dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim + 1, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+    def forward(self, c: torch.Tensor, pos01: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([c, pos01], dim=-1)
+        return self.net(x).squeeze(-1)  # [L]
 
 class REFRAG(nn.Module):
     def __init__(self, cfg: REFRAGConfig):
@@ -266,6 +293,7 @@ class REFRAG(nn.Module):
             nlayers=cfg.policy_transformer_layers,
             dropout=cfg.policy_dropout,
         ).to(self.device)
+        # self.policy = SelectPolicy(self.encoder.out_dim, hidden=cfg.policy_hidden).to(self.device)
 
         self.eos_id = self.decoder_tok.eos_token_id
         self.pad_id = self.decoder_tok.pad_token_id or self.decoder_tok.eos_token_id
@@ -373,10 +401,71 @@ class REFRAG(nn.Module):
                 scores.append(ppl)
         scores = np.asarray(scores)
         k = max(1, int(round(p_max * L)))
-        top_idx = scores.argsort()[::-1][:k]
+        top_idx = scores.argsort()[::-1][:k].copy()
         mask = torch.zeros(L, dtype=torch.bool, device=self.device)
         mask[top_idx] = True
         return mask
+
+    def build_decoder_inputs_inst_prompt(self, question: str, passages: List[str], k: int, p: float,
+                            use_policy: bool = True, sample_policy: bool = False) -> Tuple[torch.Tensor, Dict]:
+        
+        # Add instruction prompt wrapping the question
+        instruction = (
+            f"You are a helpful assistant. Answer the question using only the provided context.\n\n"
+            f"Question: {question}\n\n"
+            f"Context:\n"
+        )
+        answer_prefix = "\n\nAnswer:"
+        
+        q_ids = self._tokenize(instruction, self.cfg.max_q_tokens).input_ids.to(self.device)
+        q_emb = self._decoder_token_embeddings(q_ids)
+
+
+        ctx_text = "".join(passages)
+        chunk_strs, chunk_ids = self._chunk_text(ctx_text, k_tokens=k)
+        L = len(chunk_strs)
+
+        with torch.no_grad():
+            c = self._encode_chunks(chunk_strs)
+            ecnk = self._project_chunks(c)
+
+        expand_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
+        picked: List[int] = []
+        Tpr = self.Tprime(L, p)
+        if use_policy and Tpr > 0 and L > 0:
+            with torch.no_grad():
+                logits = self.policy(c)
+            if sample_policy:
+                picked, _ = self.sample_action_sequence(logits, Tprime=Tpr)
+            else:
+                picked = torch.topk(logits, k=min(Tpr, L)).indices.detach().cpu().tolist()
+            expand_mask = self.picked_to_mask(L, picked)
+        elif (not use_policy) and L > 0 and p > 0:
+            expand_mask = self._heuristic_select(chunk_ids, q_text=question, p_max=p)
+            picked = torch.nonzero(expand_mask).squeeze(-1).detach().cpu().tolist()
+
+        # After building seq_embs, append the answer prefix
+        answer_ids = self._tokenize(answer_prefix, 16).input_ids.to(self.device)
+        answer_emb = self._decoder_token_embeddings(answer_ids)
+        
+        seq_embs = [q_emb.squeeze(0)]
+        seg_flags = []
+        for i, ids in enumerate(chunk_ids):
+            if expand_mask[i]:
+                tok_emb = self._decoder_token_embeddings(ids.unsqueeze(0))
+                seq_embs.append(tok_emb.squeeze(0))
+                seg_flags.extend([1] * tok_emb.size(1))
+            else:
+                seq_embs.append(ecnk[i].unsqueeze(0))
+                seg_flags.append(0)
+        
+        # Append "Answer:" suffix so model knows to generate the answer
+        seq_embs.append(answer_emb.squeeze(0))
+        seg_flags.extend([1] * answer_emb.size(1))
+
+        final = torch.cat(seq_embs, dim=0).unsqueeze(0)
+        extras = {"picked": picked, "expand_mask": expand_mask.detach().cpu().numpy().tolist(), "num_chunks": L, "Tprime": int(Tpr), "token_positions_flag": seg_flags}
+        return final, extras
 
     def build_decoder_inputs(self, question: str, passages: List[str], k: int, p: float,
                             use_policy: bool = True, sample_policy: bool = False) -> Tuple[torch.Tensor, Dict]:
@@ -426,7 +515,7 @@ class REFRAG(nn.Module):
                  max_new_tokens: int = 128, temperature: float = 0.0, top_p: float = 1.0,
                  use_policy: bool = True, sample_policy: bool = False) -> Dict:
         self.decoder.eval()
-        emb_in, extras = self.build_decoder_inputs(question, passages, k=k, p=p, use_policy=use_policy, sample_policy=sample_policy)
+        emb_in, extras = self.build_decoder_inputs_inst_prompt(question, passages, k=k, p=p, use_policy=use_policy, sample_policy=sample_policy)
 
         cache = self._new_cache()
         t0 = time.time()
@@ -737,7 +826,7 @@ def cmd_cpt_recon(args):
 
 def cmd_cpt_next(args):
     seed_everything()
-    cfg = REFRAGConfig(encoder_name=args.enc, decoder_name=args.dec, chunk_len_tokens=args.k, lr=args.lr, fp16=False, torch_compile=args.torch_compile)
+    cfg = REFRAGConfig(encoder_name=args.enc, decoder_name=args.dec, chunk_len_tokens=args.k, lr=args.lr, fp16=True, torch_compile=args.torch_compile)
     model = REFRAG(cfg).to(now_device())
     if args.load_dir:
         enc_p = os.path.join(args.load_dir, "encoder.pt")
@@ -755,7 +844,7 @@ def cmd_cpt_next(args):
         return
     model.train()
 
-    CHECKPOINT_STEPS = {500}
+    # CHECKPOINT_STEPS = {500}
     gradient_accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
     accumulated_loss = 0.0
 
@@ -802,15 +891,15 @@ def cmd_cpt_next(args):
         # if step % max(1, args.log_every) == 0:
         #     tqdm.write(f"[cpt_next] step {step}/{args.steps} loss={loss.item():.4f}")
 
-        # Save intermediate checkpoints
-        if step in CHECKPOINT_STEPS:
-            # Clear cache before checkpoint to reduce memory pressure
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            ckpt_dir = os.path.join(args.out_dir, f"checkpoint_step{step}")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(ckpt_dir, "refrag_full.pt"))
-            print(f"[cpt_next] checkpoint saved at step {step} → {ckpt_dir}")
+        # # Save intermediate checkpoints
+        # if step in CHECKPOINT_STEPS:
+        #     # Clear cache before checkpoint to reduce memory pressure
+        #     if torch.cuda.is_available():
+        #         torch.cuda.empty_cache()
+        #     ckpt_dir = os.path.join(args.out_dir, f"checkpoint_step{step}")
+        #     os.makedirs(ckpt_dir, exist_ok=True)
+        #     torch.save(model.state_dict(), os.path.join(ckpt_dir, "refrag_full.pt"))
+        #     print(f"[cpt_next] checkpoint saved at step {step} → {ckpt_dir}")
 
     os.makedirs(args.out_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.out_dir, "refrag_full.pt"))
@@ -954,25 +1043,56 @@ def cmd_generate(args):
                 model.policy.load_state_dict(safe_torch_load(pol_p, map_location=now_device()))
             print("[generate] loaded available component weights.")
 
-    texts, index = load_index_bundle(args.index_dir)
-    qenc = PassageEncoder(args.embed_model)
-    qv = qenc.encode_query(args.question)
-    _, I = search_index(index, qv, args.topk)
-    passages = [texts[i] for i in I]
+    # texts, index = load_index_bundle(args.index_dir)
+    # qenc = PassageEncoder(args.embed_model)
+    # qv = qenc.encode_query(args.question)
+    # _, I = search_index(index, qv, args.topk)
+    # passages = get_passages(args.question)
+    # passages = [texts[i] for i in I]
 
-    out = model.generate(
-        question=args.question,
-        passages=passages,
-        k=args.k,
-        p=args.p,
-        max_new_tokens=args.max_new,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        use_policy=(not args.heuristic),
-        sample_policy=args.sample_policy,
-    )
-    print(json.dumps({"question": args.question, "passages": passages, **out}, indent=2))
+    with open(args.input_file, "r") as f:
+        raw = json.load(f)
 
+    data = raw["data"]
+    results = []
+    total = len(data) * args.num_runs
+
+
+    for item in data:
+        question = item["question"]
+        passages = [parse_original(entry) for entry in item["context"]]
+
+        for run_idx in range(args.num_runs):
+
+            out = model.generate(
+                question=question,
+                passages=passages,
+                k=args.k,
+                p=args.p,
+                max_new_tokens=args.max_new,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                use_policy=(not args.heuristic),
+                sample_policy=args.sample_policy,
+            )
+
+
+            results.append({
+                "question": question,
+                "run": run_idx + 1,
+                "passages": passages,
+                "Context": item["context"],
+                "ground_truth": item["ground_truth"],
+                **out,
+            })
+
+
+    if os.path.dirname(args.output_file):
+        os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    with open(args.output_file, "w") as f:
+        json.dump({"results": results}, f, indent=2)
+
+    print(f"[generate] saved {len(results)} results to {args.output_file}")
 
 def build_argparser():
     p = argparse.ArgumentParser(description="REFRAG-style RAG (paper-aligned selective compression RL)")
@@ -1030,11 +1150,11 @@ def build_argparser():
     sp.set_defaults(func=cmd_train_policy)
 
     sp = sub.add_parser("generate", help="RAG generate with compression/expansion")
-    sp.add_argument("--index_dir", type=str, required=True)
+    # sp.add_argument("--index_dir", type=str, required=True)
     sp.add_argument("--embed_model", type=str, default="BAAI/bge-small-en-v1.5")
     sp.add_argument("--enc", type=str, default="roberta-base")
     sp.add_argument("--dec", type=str, default="meta-llama/Llama-3.2-3B")
-    sp.add_argument("--question", type=str, required=True)
+    # sp.add_argument("--question", type=str, required=True)
     sp.add_argument("--topk", type=int, default=8)
     sp.add_argument("--k", type=int, default=64)
     sp.add_argument("--p", type=float, default=0.25)
@@ -1046,6 +1166,9 @@ def build_argparser():
     sp.add_argument("--sample_policy", action="store_true")
     sp.add_argument("--load_dir", type=str, default="")
     sp.add_argument("--torch_compile", action="store_true")
+    sp.add_argument("--input_file", type=str, required=True)
+    sp.add_argument("--output_file", type=str, required=True)
+    sp.add_argument("--num_runs", type=int, default=1)
     sp.set_defaults(func=cmd_generate)
 
     return p
